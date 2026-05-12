@@ -8,6 +8,7 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local HttpService = game:GetService("HttpService")
 local MessagingService = game:GetService("MessagingService")
 
+-- configs and secrets loaded from ServerScriptService so they're never exposed to the client
 local ConfigsFolder = ServerScriptService:WaitForChild("Config")
 local Secrets = require(ConfigsFolder:WaitForChild("SecretsAPI"))
 
@@ -16,8 +17,10 @@ local API_KEY = Secrets.WORKER_API_KEY or "Same"
 
 local Packages = ServerScriptService:WaitForChild("Packages")
 local Configs = ServerScriptService:WaitForChild("Config")
-
 local Shared = ReplicatedStorage:WaitForChild("Shared")
+
+-- SharedPackets exposes the RemoteEvent/RemoteFunction shared between server and client
+-- Using Packet: https://www.bing.com/ck/a?!&&p=2546d8503434447c633cbe15524223a1f279bc73c931f6277549841bcaeb8a20JmltdHM9MTc3ODU0NDAwMA&ptn=3&ver=2&hsh=4&fclid=2aff427a-f848-6511-3eff-544df99564ca&psq=packet+devforum&u=a1aHR0cHM6Ly9kZXZmb3J1bS5yb2Jsb3guY29tL3QvcGFja2V0LW5ldHdvcmtpbmctbGlicmFyeS8zNTczOTA3
 local SharedPackets = require(Shared.SharedPacket)
 local notifyModule = require(ServerScriptService.Packages.NotifyClient)
 
@@ -30,27 +33,36 @@ local DataService = require(ServerScriptService.Services.ServerInitializer.Datas
 local SeedStockTable = require(Configs.SeedStock)
 
 local SEED_STOCK_NAME = "SeedStock"
-local RESTOCK_INTERVAL = 300
+local RESTOCK_INTERVAL = 300 -- fallback interval in seconds if the worker doesn't respond
 
+-- debounce to avoid multiple restock notifications firing in quick succession
 local lastRestockNotify = 0
 local RESTOCK_NOTIFY_DEBOUNCE = 2
 
 local PacksFolder = ServerStorage:FindFirstChild("Packs")
 local BrainrotsFolder = ServerStorage:FindFirstChild("Brainrots")
 
+-- current countdown to next restock, updated both via polling and via MessagingService
 local currentCountdown = nil
 
+-- cache of the merged global stock and the config received from the worker
 local cachedMergedStock = nil
 local cachedSeedCfg = nil
 local cachedStockId = nil
 
+-- ToolCache indexes Tools by name to avoid scanning BrainrotsFolder on every purchase
 local ToolCache = {}
+
+-- personalPool[stockName][userId] tracks remaining items per player
+-- derived from global stock by subtracting purchases persisted in the datastore
 local personalPool = {}
 
+-- loop control flags
 local _running = false
 local _paused = false
 local _loopThread = nil
 
+-- pre-cache all Tools inside BrainrotsFolder at startup for O(1) lookup
 local function IndexTools()
 	if not BrainrotsFolder then return end
 	for _, descendant in ipairs(BrainrotsFolder:GetDescendants()) do
@@ -61,6 +73,7 @@ local function IndexTools()
 end
 IndexTools()
 
+-- deduplicates SeedStockTable in case there are entries with the same name
 local function buildCombinedMetaList()
 	local out = {}
 	local seen = {}
@@ -72,17 +85,21 @@ local function buildCombinedMetaList()
 	end
 	return out
 end
+
 local CombinedStockTable = buildCombinedMetaList()
+
+-- lookup set for fast membership check on the item catalog
 local CombinedStockLookup = {}
 for _,m in ipairs(CombinedStockTable) do CombinedStockLookup[m.name] = true end
 
 local function findMetaByName(name)
-	for _,m in ipairs(SeedStockTable) do 
+	for _,m in ipairs(SeedStockTable) do
 		if m.name == name then return m, SEED_STOCK_NAME end
 	end
 	return nil, nil
 end
 
+-- compares old and new maps to detect if at least one item increased in quantity (= restock happened)
 local function detectRestock(oldMap, newMap)
 	if type(newMap) ~= "table" then return false end
 	if type(oldMap) ~= "table" then
@@ -103,6 +120,7 @@ local function notifyAllPlayers(message, seconds, tag)
 	end
 end
 
+-- builds the stock array to send to the client from the player's personal pool
 local function buildFullStockFromPool(mergedPoolForPlayer, stockMetaList)
 	local out = table.create(#stockMetaList)
 	for _, meta in ipairs(stockMetaList) do
@@ -120,6 +138,8 @@ local function buildFullStockFromPool(mergedPoolForPlayer, stockMetaList)
 	return out
 end
 
+-- persists the player's purchases in the datastore along with the current stockId
+-- the stockId is used to invalidate saved data if a restock happened in the meantime
 local function saveLastPersonalStockForPlayer(player, saveTable)
 	if not player or not player.UserId then return end
 	saveTable = saveTable or {}
@@ -138,14 +158,16 @@ local function readLastPersonalStockForPlayer(player)
 	if ok and type(data) == "table" then
 		return data
 	end
-	return {} 
+	return {}
 end
 
+-- subtracts saved purchases from poolMap, but only if the stockId matches
+-- if the stock changed (restock), the saved data is ignored and the pool starts full
 local function applySavedPurchasesToPoolMap(poolMap, saved)
 	if type(poolMap) ~= "table" or type(saved) ~= "table" then return end
 	if cachedStockId == nil then return end
 	local currentIdString = tostring(cachedStockId)
-	local savedIdString = tostring(saved.stockId) 
+	local savedIdString = tostring(saved.stockId)
 	if currentIdString ~= savedIdString then return end
 	if type(saved.purchases) == "table" then
 		for name, amount in pairs(saved.purchases) do
@@ -159,6 +181,8 @@ local function applySavedPurchasesToPoolMap(poolMap, saved)
 	end
 end
 
+-- clones the Tool from cache or searches the BrainrotsFolder/rarity/name structure
+-- and delivers it to the player's Backpack for the requested quantity
 local function giveSeedToolToPlayer(player, meta, qty)
 	if not meta then return end
 	local toolTemplate = ToolCache[meta.name]
@@ -189,6 +213,8 @@ local function giveSeedToolToPlayer(player, meta, qty)
 	end)
 end
 
+-- wrapper around HttpService:RequestAsync with fallback to GetAsync/PostAsync
+-- handles x-api-key header and JSON body serialization
 local function workerRequest(path, method, body)
 	method = method or "GET"
 	local url = WORKER_URL .. path
@@ -209,6 +235,7 @@ local function workerRequest(path, method, body)
 	end
 	local ok, res = pcall(function() return HttpService:RequestAsync(options) end)
 	if not ok then
+		-- RequestAsync unavailable (e.g. Studio without HTTP enabled): fall back to legacy methods
 		if method == "GET" then
 			local succ, bodyOrErr = pcall(function() return HttpService:GetAsync(url, true) end)
 			if not succ then return false, ("Fallback GetAsync failed: "..tostring(bodyOrErr)) end
@@ -231,6 +258,7 @@ local function workerRequest(path, method, body)
 	end
 end
 
+-- converts the stock array [{name, amount}] returned by the worker into a map {name = amount}
 local function arrayToMap(stockArray)
 	local map = {}
 	for _, entry in ipairs(stockArray or {}) do
@@ -241,6 +269,8 @@ local function arrayToMap(stockArray)
 	return map
 end
 
+-- updates every connected player's personalPool with the new global stock,
+-- then re-applies their previous purchases and FireAllClients the updated payload
 local function applyMergedStockToPlayers(mergedMap)
 	personalPool[SEED_STOCK_NAME] = personalPool[SEED_STOCK_NAME] or {}
 	for _, player in ipairs(Players:GetPlayers()) do
@@ -267,10 +297,14 @@ local function applyMergedStockToPlayers(mergedMap)
 	end
 end
 
+-- main polling function: GET /stock from the Cloudflare worker
+-- if the stock doesn't exist on the worker yet, initializes it via POST /set-seed
+-- updates cachedMergedStock, detects restocks and propagates timeToRestock to clients
 local function fetchStockFromWorker()
 	local ok, bodyOrErr = workerRequest("/stock?name="..HttpService:UrlEncode(SEED_STOCK_NAME), "GET")
 	if not ok then
 		if tostring(bodyOrErr):find("unknown stock") then
+			-- first boot: the worker doesn't know this stock yet, so we create it
 			local payload = {}
 			payload[SEED_STOCK_NAME] = {
 				stockItems = SeedStockTable,
@@ -333,6 +367,8 @@ local function fetchStockFromWorker()
 	return t, data
 end
 
+-- initializes a player's personal pool by copying the global stock
+-- so each player starts with the same quantities as the global and reductions are per-player
 local function initPersonalPoolForPlayerStock(stockName, userId, globalOverride)
 	personalPool[stockName] = personalPool[stockName] or {}
 	local global = globalOverride or cachedMergedStock or {}
@@ -347,6 +383,7 @@ local function initPersonalPoolForPlayerStock(stockName, userId, globalOverride)
 	return map
 end
 
+-- merges per-stock pools into a single map for the client
 local function getMergedPoolForPlayer(userId)
 	local merged = {}
 	for _, meta in ipairs(CombinedStockTable) do
@@ -373,6 +410,9 @@ local function broadcastTimeToStock(seconds)
 	end
 end
 
+-- handler for messages arriving from MessagingService (topic "stock-updates")
+-- the worker pushes updates in compact format {n, a} to stay within MessagingService payload limits
+-- also handles admin add/remove commands and fetchFullFromWorker as a fallback
 local function onStockMessage(message)
 	local ok, data = pcall(function() return HttpService:JSONDecode(message.Data) end)
 	if not ok then
@@ -383,6 +423,7 @@ local function onStockMessage(message)
 	if data.stockName and data.stockName ~= SEED_STOCK_NAME then return end
 
 	if data.compactStock and type(data.compactStock) == "table" then
+		-- compact format: {n = name, a = amount} to fit within MessagingService size limits
 		local mergedMap = {}
 		for _, e in ipairs(data.compactStock) do
 			if e and e.n then
@@ -401,6 +442,7 @@ local function onStockMessage(message)
 		end
 
 	elseif data.action == "add" and data.item then
+		-- admin added an item: update local cache without a full refetch
 		local itemName = data.item.name
 		local itemAmount = tonumber(data.item.amount) or 1
 		local msg = string.format("Admin added: %s x%d to stock!", itemName, itemAmount)
@@ -412,23 +454,25 @@ local function onStockMessage(message)
 			cachedMergedStock[itemName] = currentAmt + itemAmount
 			applyMergedStockToPlayers(cachedMergedStock)
 		else
-			data.fetchFullFromWorker = true 
+			data.fetchFullFromWorker = true
 		end
 
 	elseif data.action == "remove" and data.item then
+		-- admin removed an item: zero out the quantity in the cache
 		local itemName = data.item.name
 		local msg = string.format("Admin removed: %s from stock!", itemName)
 		for _, player in ipairs(Players:GetPlayers()) do
 			notifyModule.Notify(player, msg, 3)
 		end
 		if cachedMergedStock and cachedMergedStock[itemName] then
-			cachedMergedStock[itemName] = 0 
+			cachedMergedStock[itemName] = 0
 			applyMergedStockToPlayers(cachedMergedStock)
 		else
 			data.fetchFullFromWorker = true
 		end
 	end
 
+	-- if the cache was nil or inconsistent, full refetch as a safety net
 	if data.fetchFullFromWorker then
 		spawn(function()
 			local path = "/stock?name=" .. HttpService:UrlEncode(SEED_STOCK_NAME)
@@ -452,12 +496,16 @@ end
 
 Players.PlayerAdded:Connect(function(player)
 	local uId = player.UserId
+
+	-- if the server doesn't have stock yet (first player of the session), fetch immediately
 	if cachedMergedStock == nil or cachedStockId == nil then
 		local ok, err = pcall(function() fetchStockFromWorker() end)
 		if not ok then
 			warn("[StockSync] initial fetchStockFromWorker failed in PlayerAdded: " .. tostring(err))
 		end
 	end
+
+	-- init personal pool and restore previous purchases from the datastore
 	if cachedMergedStock then
 		initPersonalPoolForPlayerStock(SEED_STOCK_NAME, uId, cachedMergedStock)
 	else
@@ -469,6 +517,8 @@ Players.PlayerAdded:Connect(function(player)
 		personalPool[SEED_STOCK_NAME][uId] = personalPool[SEED_STOCK_NAME][uId] or initPersonalPoolForPlayerStock(SEED_STOCK_NAME, uId, cachedMergedStock)
 		applySavedPurchasesToPoolMap(personalPool[SEED_STOCK_NAME][uId], saved)
 	end
+
+	-- 1s delay to make sure the client finished loading before sending data
 	task.delay(1, function()
 		if player.Parent then
 			local mergedPool = getMergedPoolForPlayer(uId)
@@ -494,6 +544,7 @@ Players.PlayerAdded:Connect(function(player)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+	-- clean up the in-memory pool on disconnect; persisted data stays in the datastore
 	local okSave, err = pcall(function()
 		if personalPool[SEED_STOCK_NAME] and personalPool[SEED_STOCK_NAME][player.UserId] then
 			personalPool[SEED_STOCK_NAME][player.UserId] = nil
@@ -524,31 +575,35 @@ if BuyStockFunction then
 		local qty = tonumber(purchase.amount) or 1
 		if qty <= 0 then
 			notifyModule.Notify(player, "The seed is not in stock!", 3, "Error")
-			return false 
+			return false
 		end
 		local meta, assumedStock = findMetaByName(purchase.name)
-		if not meta then 
+		if not meta then
 			notifyModule.Notify(player, "The seed is not in stock!", 3, "Error")
-			return false 
+			return false
 		end
 		local stockName = SEED_STOCK_NAME
 		local uId = player.UserId
-		local pool = personalPool[stockName] and personalPool[stockName][uId] 
-		if not pool then 
-			pool = initPersonalPoolForPlayerStock(stockName, uId) 
+		local pool = personalPool[stockName] and personalPool[stockName][uId]
+		if not pool then
+			pool = initPersonalPoolForPlayerStock(stockName, uId)
 		end
+
+		-- server-side validation: check availability in the player's personal pool
 		local remain = pool[purchase.name] or 0
-		if remain <= 0 or qty > remain then 
+		if remain <= 0 or qty > remain then
 			notifyModule.Notify(player, "The seed is not in stock!", 3, "Error")
-			return false 
+			return false
 		end
 		local pricePer = meta.Price or 0
 		local totalPrice = pricePer * qty
 		local coins = DataService.Get(player, "Money")
-		if not coins or coins < totalPrice then 
+		if not coins or coins < totalPrice then
 			notifyModule.Notify(player, "You don't have enough money!", 3, "")
-			return false 
+			return false
 		end
+
+		-- transaction: deduct money, update local pool, deliver tool
 		DataService.Remove(player, "Money", totalPrice)
 		pool[purchase.name] = remain - qty
 		local mergedPool = getMergedPoolForPlayer(uId)
@@ -560,6 +615,9 @@ if BuyStockFunction then
 		end)
 		giveSeedToolToPlayer(player, meta, qty)
 		notifyModule.Notify(player, "You succesfully bought: "..purchase.name, 3)
+
+		-- update the purchase record in the datastore
+		-- if the stockId changed (restock in the meantime), reset the record before saving
 		local okRead, prev = pcall(function() return DataService.Get(player, "LastPersonalStock") end)
 		local saved = (okRead and type(prev) == "table") and prev or {}
 		if tostring(saved.stockId) ~= tostring(cachedStockId) then
@@ -575,6 +633,8 @@ if BuyStockFunction then
 	end
 end
 
+-- subscribe to the MessagingService topic to receive pushes from the Cloudflare worker
+-- allows real-time updates without waiting for the polling loop
 local succ, err = pcall(function()
 	MessagingService:SubscribeAsync("stock-updates", function(msg) onStockMessage(msg) end)
 end)
@@ -584,13 +644,14 @@ end
 
 local StockService = {}
 
+-- polling loop: fetch every timeToRestock seconds, tick the client every second
+-- handles _paused without killing the thread, useful for maintenance or debugging
 local function runLoop()
 	while _running do
 		while _paused and _running do
 			Task.wait(0.5)
 		end
 		if not _running then break end
-
 		local t, dataOrErr
 		local ok, err = pcall(function()
 			t, dataOrErr = fetchStockFromWorker()
@@ -615,6 +676,7 @@ local function runLoop()
 			end
 		end
 
+		-- countdown with a broadcast every second until it expires
 		while currentCountdown > 0 and _running do
 			if not _paused then
 				pcall(function()
@@ -671,6 +733,7 @@ function StockService.IsPaused()
 	return _paused
 end
 
+-- forces an immediate fetch by zeroing the countdown, useful for testing or admin panel
 function StockService.ForceRestock()
 	if not _running then return end
 	currentCountdown = 0
